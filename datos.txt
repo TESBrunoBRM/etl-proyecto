@@ -1,0 +1,11 @@
+id,nombre_ciudad,pais,poblacion
+1,BUENOS AIRES,ARGENTINA,15000000
+2,Sao Paulo,Brasil,22000000
+3, MÉXICO D.F.,México,21000000
+4, Santiago, Chile,6000000
+5, buenos aires,argentina,14999999
+6, Bogotá,Colombia,8000000
+7, LIMA,PERÚ,10000000
+8,méxico d.f.,méxico,20999999
+9,santiago,chile,5999999
+10, Ciudad de Panamá.,Panamá,1800000
