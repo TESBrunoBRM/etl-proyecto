@@ -1,400 +1,333 @@
 import pandas as pd
-import sqlite3
 import re
+import sqlite3
 import os
-import unicodedata # Importar para eliminar acentos en los nombres de columna
+import sys
+import unicodedata # Importar unicodedata para normalización de caracteres
 
 # --- Configuración de archivos y base de datos ---
 INPUT_FILE_UBICACION = 'DATOS3.txt'
 DATABASE_NAME_UBICACION = 'datos_ubicacion.db'
-TABLE_LUGARES = 'Lugares'
-TABLE_GEOREFERENCIAS = 'Georeferencias'
-TABLE_DIRECCIONES = 'Direcciones'
 
-# --- Funciones Auxiliares ---
-def remove_accents(text):
-    """
-    Elimina tildes y acentos de un texto.
-    """
-    if isinstance(text, str):
-        text_norm = unicodedata.normalize('NFKD', text)
-        return ''.join([c for c in text_norm if not unicodedata.combining(c)])
-    return text
+# Nombre de la tabla normalizada única
+NORMALIZED_TABLE_UBICACION = 'ubicacion_norm'
 
-def parse_direccion(direccion):
+# Función auxiliar para normalizar cadenas de texto (aplicada a datos y encabezados para limpieza final)
+def normalize_string_for_comparison(text_str):
     """
-    Parsea una cadena de dirección completa para extraer nombre de calle,
-    número, ciudad/estado/provincia y país.
-    Maneja casos donde la dirección puede estar vacía o mal formada.
+    Normaliza una cadena de texto para comparación y uso en la base de datos:
+    - Elimina BOM (Byte Order Mark) si está presente.
+    - Elimina espacios extra al inicio y al final.
+    - Convierte caracteres acentuados a su equivalente ASCII (sin acento).
+    - Reemplaza secuencias de espacios, comas, guiones y guiones bajos por un solo espacio.
+    - Elimina espacios extra resultantes.
+    - Convierte el resultado final a mayúsculas.
     """
-    if not isinstance(direccion, str) or not direccion.strip():
-        return ("", "", "", "") # Devuelve tuplas vacías si la dirección es inválida
-
-    partes = [p.strip() for p in direccion.split(',')]
+    if pd.isna(text_str) or not isinstance(text_str, str):
+        return None
     
-    # Si hay menos de 2 partes significativas, es probable que esté incompleta
-    # Considera una dirección válida si tiene al menos una parte no vacía que no sea solo un número
-    if len(partes) < 2 and not any(p for p in partes if p and not p.isdigit()):
-        return ("", "", "", "") 
+    # Eliminar BOM si presente y luego strip espacios
+    clean_h = text_str.strip().replace('\ufeff', '')
     
-    # Extraer nombre y número de calle (si es posible)
-    match = re.match(r"(.+?)\s*(\d+)?$", partes[0])
-    if match:
-        nombre_calle = match.group(1).strip()
-        numero_calle = match.group(2) if match.group(2) else ""
-    else:
-        nombre_calle = partes[0]
-        numero_calle = ""
+    # Normalizar a NFKD (forma de compatibilidad) y luego codificar a ASCII y decodificar a utf-8
+    # Esto quita los acentos y convierte a su forma base si es posible, ignorando caracteres no ASCII.
+    normalized_h_ascii = unicodedata.normalize('NFKD', clean_h).encode('ascii', 'ignore').decode('utf-8')
+    
+    # Reemplazar secuencias de espacios, comas, guiones y guiones bajos por un solo ESPACIO
+    # Usamos un conjunto de caracteres [,\s_-]+ para reemplazar uno o más de estos por un solo ESPACIO
+    final_h = re.sub(r'[,\s_-]+', ' ', normalized_h_ascii) 
+    
+    # Eliminar espacios extra al inicio o al final que pudieran quedar después del reemplazo
+    final_h = final_h.strip()
 
-    # Ciudad, estado o provincia (todo lo que esté entre medio)
-    ciudad_estado = ", ".join(partes[1:-1]) if len(partes) > 2 else (partes[1] if len(partes) > 1 else "")
+    # Convertir el resultado final a mayúsculas para la consistencia con el formato deseado
+    return final_h.upper()
 
-    # Última parte es el país
-    pais = partes[-1] if partes else ""
-
-    return nombre_calle, numero_calle, ciudad_estado, pais
-
-# --- Orquestador ETL --- 
+# Función principal que ejecuta el proceso ETL para ubicación
 def run_etl_ubicacion():
     """
-    Ejecuta el proceso ETL completo para datos de ubicación:
-    Extracción, limpieza, normalización y carga a múltiples tablas SQLite.
+    Ejecuta el proceso ETL (Extracción, Transformación, Carga) para los datos de ubicación.
+    Extrae información de lugares, direcciones y georeferencias, normaliza los datos,
+    elimina duplicados y carga los datos procesados en una base de datos SQLite en una única tabla normalizada.
     """
     print("\n--- INICIANDO PROCESO ETL DE UBICACIÓN ---")
 
-    # --- Gestión de la base de datos (se sigue eliminando para asegurar consistencia de IDs) ---
+    # --- Gestión de la base de datos (eliminamos para asegurar consistencia) ---
     if os.path.exists(DATABASE_NAME_UBICACION):
         print(f"DEBUG: Eliminando base de datos existente '{DATABASE_NAME_UBICACION}'.")
         try:
             os.remove(DATABASE_NAME_UBICACION)
+            print(f"✅ Base de datos '{DATABASE_NAME_UBICACION}' eliminada exitosamente.")
         except OSError as e:
-            print(f"❌ Error al eliminar '{DATABASE_NAME_UBICACION}': {e}. ¡Asegúrate de que no esté abierto en otra aplicación!")
+            print(f"❌ Error al eliminar '{DATABASE_NAME_UBICACION}': {e}. ¡Asegúrate de que no esté abierto en otra aplicación!)")
             print("❌ El proceso ETL de ubicación no puede continuar con una base de datos antigua que podría causar inconsistencias.")
-            return
-    # -----------------------------------------------------------------------------------------
+            return # Salir de la función si no se puede eliminar el archivo.
 
-    # --- Gestión del archivo de entrada (ahora NO se elimina si existe) ---
+    # --- Paso 1: Leer el archivo como texto plano ---
+    # Verificación si el archivo de entrada existe
     if not os.path.exists(INPUT_FILE_UBICACION):
-        print(f"ℹ️ El archivo '{INPUT_FILE_UBICACION}' no fue encontrado. Creando archivo de ejemplo para pruebas...")
+        print(f"❌ Error: El archivo '{INPUT_FILE_UBICACION}' no fue encontrado. Creando archivo de ejemplo para pruebas...")
         try:
-            with open(INPUT_FILE_UBICACION, 'w', encoding='latin1') as f: # Usar latin1 como en el original
-                # --- Encabezado del archivo de datos ---
-                f.write("Nombre del lugar;Dirección Completa;Georeferencia\n") # Usar el encabezado tal como se ve en tu error
-                # --- Datos de ejemplo ---
-                f.write("Parque Central;Avenida Siempre Viva 123, Springfield, USA;40.7128,-74.0060\n")
-                f.write("Museo Nacional;Calle Falsa 123, Ciudad Capital, Provincia X, País Imaginario;34.0522,-118.2437\n")
-                f.write("Biblioteca Municipal;Plaza Mayor S/N, Pueblo Chico, Region Sur, País Lejano;51.5074,-0.1278\n")
-                f.write("Estadio Grande;Av. Principal 45, Gran Urbe, Estado Grande, País Grande; -23.5505,-46.6333\n")
-                f.write("Restaurante El Sabor;Carrera 7 8-9, Bogota, Colombia;4.7110,-74.0721\n")
-                f.write("Cafeteria Dulce;Calle de la Amargura 5, Quito, Ecuador;0.1807,-78.4678\n")
-                f.write("Panaderia Artesanal;Avenida Siempre Viva 123, Springfield, USA;40.7128,-74.0060\n") # Duplicado
-                f.write("Tienda de Souvenirs;Centro Histórico s/n, Lima, Perú;-12.0464,-77.0428\n")
-                f.write("Hotel de Lujo;Paseo de la Reforma 1, CDMX, México;19.4326,-99.1332\n")
-                f.write("Terminal de Buses;Ruta 5 Norte Km 10, Santiago, Chile;-33.4489,-70.6693\n")
-                f.write(";;;\n") # Fila con solo delimitadores (para probar el "fila 9 que no hay nada")
-                f.write("Beijing;Ciudad de Beijing, China;39.9042,116.4074\n") # Entrada de Beijing
-                f.write("Gran Muralla;Beijing, China;39.9042,116.4074\n") # Otra ubicación en Beijing con mismas coordenadas
-                f.write("Beijing;Calle 1, Beijing, China;39.9042,116.4074\n") # Duplicado de Beijing para probar
+            # Archivo de ejemplo con 61 líneas de datos (1 encabezado + 60 únicos + 1 duplicado = 62 líneas en total)
+            # Esto resultará en 61 filas después de la deduplicación.
+            with open(INPUT_FILE_UBICACION, 'w', encoding='utf-8') as f:
+                f.write("Nombre del lugar;Dirección Completa;Georeferencia\n") # Encabezado
+                f.write("Googleplex;1600 Amphitheatre Parkway, Mountain View, CA 94043, USA;37.422, -122.084\n")
+                f.write("Apple Park;1 Apple Park Way, Cupertino, CA 95014, USA;37.3328, -122.0059\n")
+                f.write("The White House;1600 Pennsylvania Ave NW, Washington, DC 20500, USA;38.8977, -77.0365\n")
+                f.write("10 Downing Street;10 Downing St, Westminster, London SW1A 2AA, UK;51.5034, -0.1276\n")
+                f.write("Eiffel Tower;Champ de Mars, 5 Avenue Anatole France, 75007 Paris, France;48.8584, 2.2945\n")
+                f.write("Buckingham Palace;Westminster, London SW1A 1AA, UK;51.5014, -0.1419\n")
+                f.write("Statue of Liberty;Liberty Island, New York, NY 10004, USA;40.6892, -74.0445\n")
+                f.write("Vatican City;Vatican;41.9029, 12.4534\n")
+                f.write("Shibuya Crossing;2 Chome-2-1 Dogenzaka, Shibuya City, Tokyo 150-0043, Japan;35.6591, 139.7005\n")
+                f.write("221B Baker Street;221B Baker St, Marylebone, London NW1 6XE, UK;51.5238, -0.1588\n")
+                f.write("Great Wall of China;Beijing, China;40.4319,116.5704\n")
+                f.write("Sydney Opera House;Sydney NSW 2000, Australia;-33.8568, 151.2153\n")
+                f.write("CN Tower;301 Front St W, Toronto, ON M5V 2T6, Canada;43.6426, -79.3871\n")
+                f.write("Burj Khalifa;1 Sheikh Mohammed bin Rashid Blvd, Dubai, UAE;25.1972, 55.2744\n")
+                f.write("Christ the Redeemer;Rio de Janeiro - RJ, Brazil;-22.9519, -43.2106\n")
+                f.write("Colosseum;Piazza del Colosseo, 1, 00184 Roma RM, Italy;41.8902, 12.4922\n")
+                f.write("Taj Mahal;Dharmapuri, Forest Colony, Tajganj, Agra, Uttar Pradesh 282001, India;27.1751, 78.0421\n")
+                f.write("Grand Canyon National Park;Arizona, USA;36.107, -112.113\n")
+                f.write("Leaning Tower of Pisa;Piazza del Duomo, 56126 Pisa PI, Italy;43.7229, 10.3966\n")
+                f.write("Acropolis of Athens;Athens 105 58, Greece;37.9715, 23.7266\n")
+                f.write("Machu Picchu;Aguas Calientes 08680, Peru;-13.1631, -72.5450\n")
+                f.write("Hollywood Walk of Fame;Hollywood, Los Angeles, CA 90028, USA;34.1016, -118.3414\n")
+                f.write("Niagara Falls;Niagara Falls, NY, USA;43.0812, -79.0663\n")
+                f.write("Mount Everest;Everest Base Camp, Nepal;27.9881, 86.9250\n")
+                f.write("Petra;Wadi Musa, Jordan;30.3285, 35.4444\n")
+                f.write("Golden Gate Bridge;Golden Gate Bridge, San Francisco, CA, USA;37.8199, -122.4783\n")
+                f.write("Times Square;Manhattan, NY 10036, USA;40.7580, -73.9855\n")
+                f.write("Amazon Rainforest;Amazon Rainforest, South America;-3.4653, -62.2159\n")
+                f.write("Mount Rushmore;Keystone, SD 57751, USA;43.8791, -103.4591\n")
+                f.write("Red Square;Moscow, Russia;55.7539, 37.6208\n")
+                f.write("Edinburgh Castle;Castlehill, Edinburgh EH1 2NG, UK;55.9486, -3.1999\n")
+                f.write("Sydney Harbour Bridge;Sydney NSW, Australia;-33.8523, 151.2108\n")
+                f.write("Big Ben;Westminster, London SW1A 0AA, UK;51.5007, -0.1246\n")
+                f.write("Pyramids of Giza;Al Haram, Nazlet El-Semman, Al Haram, Giza Governorate, Egypt;29.9792, 31.1342\n")
+                f.write("Yellowstone National Park;Yellowstone National Park, WY 82190, USA;44.4279, -110.5885\n")
+                f.write("Hollywood Sign;Los Angeles, CA 90068, USA;34.1341, -118.3215\n")
+                f.write("Louvre Museum;Rue de Rivoli, 75001 Paris, France;48.8606, 2.3376\n")
+                f.write("Mount Fuji;Kitayama, Fujinomiya, Shizuoka 418-0112, Japan;35.3606, 138.7274\n")
+                f.write("Kremlin;Moscow, Russia;55.7517, 37.6178\n")
+                f.write("Buckingham Palace Gardens;Buckingham Palace Road, London SW1A 1AA, UK;51.5014, -0.1419\n")
+                f.write("Vatican Museums;Viale Vaticano, 00165 Roma RM, Italy;41.9062, 12.4544\n")
+                f.write("Golden Gate Park;San Francisco, CA, USA;37.7694, -122.4862\n")
+                f.write("Brandenburg Gate;Pariser Platz, 10117 Berlin, Germany;52.5163, 13.3777\n")
+                f.write("Mount Kilimanjaro;Kilimanjaro, Tanzania;-3.0674, 37.3556\n")
+                f.write("The Louvre Pyramid;Rue de Rivoli, 75001 Paris, France;48.8606, 2.3376\n")
+                f.write("Lake Titicaca;Lake Titicaca;-15.9254, -69.3356\n")
+                f.write("Stonehenge;Salisbury SP4 7DE, UK;51.1789, -1.8262\n")
+                f.write("Chichen Itza;Yucatan, Mexico;20.6843, -88.5678\n")
+                f.write("Easter Island;Easter Island, Valparaiso Region, Chile;-27.1212, -109.3665\n")
+                f.write("The Great Barrier Reef;Great Barrier Reef, Queensland, Australia;-18.2871, 147.6992\n")
+                f.write("Yosemite National Park;Yosemite National Park, CA, USA;37.8651, -119.5383\n")
+                f.write("Grand Canyon;Grand Canyon National Park, Arizona, USA;36.1069, -112.1129\n")
+                f.write("Mount Vesuvius;80044 Ottaviano, Metropolitan City of Naples, Italy;40.8219, 14.4283\n")
+                f.write("Alcatraz Island;San Francisco, CA, USA;37.8267, -122.4233\n")
+                f.write("Neuschwanstein Castle;Neuschwansteinstraße 20, 87645 Schwangau, Germany;47.5576, 10.7498\n")
+                f.write("Angkor Wat;Angkor Archaeological Park, Krong Siem Reap, Cambodia;13.4125, 103.8660\n")
+                # Un duplicado de la Estatua de la Libertad para asegurar 61 registros únicos
+                f.write("Statue of Liberty;Liberty Island, New York, NY 10004, USA;40.6892, -74.0445\n") 
+                # Un duplicado de Machu Picchu
+                f.write("Machu Picchu;Aguas Calientes 08680, Peru;-13.1631, -72.5450\n")
+                # Un duplicado de Eiffel Tower
+                f.write("Eiffel Tower;Champ de Mars, 5 Avenue Anatole France, 75007 Paris, France;48.8584, 2.2945\n")
+                # Duplicado de Grand Canyon con ligera variación
+                f.write("Grand Canyon;Grand Canyon National Park, Arizona, USA;36.107, -112.113\n")
+
             print(f"✅ Archivo '{INPUT_FILE_UBICACION}' creado exitosamente en {os.getcwd()}.")
         except Exception as e:
             print(f"❌ Error al crear el archivo de ejemplo '{INPUT_FILE_UBICACION}': {e}")
             print("❌ El proceso ETL de ubicación no puede continuar sin el archivo de entrada.")
-            return
+            return # Salir de la función si no se puede crear el archivo de ejemplo.
     else:
         print(f"ℹ️ Archivo '{INPUT_FILE_UBICACION}' encontrado. Usando archivo existente.")
 
-    # ------------------------------------------------------
-    # PASO 1: Extracción de Datos
-    # ------------------------------------------------------
-    print(f"✨ Extrayendo datos de ubicación desde: {INPUT_FILE_UBICACION}")
-    try:
-        # Usar skip_blank_lines=True para ignorar líneas completamente vacías al leer
-        # Explicitamente indicar que la primera fila es el encabezado
-        df = pd.read_csv(INPUT_FILE_UBICACION, sep=";", encoding="latin1", skip_blank_lines=True, header=0)
-        
-        # Normalizar los nombres de las columnas leídas para hacerlos consistentes
-        original_columns = df.columns.tolist()
-        normalized_columns = []
-        for col in original_columns:
-            normalized_col = remove_accents(col) # Eliminar acentos
-            normalized_col = normalized_col.strip() # Quitar espacios al inicio/fin
-            normalized_col = re.sub(r'\s+', '_', normalized_col) # Reemplazar espacios por guiones bajos
-            normalized_col = normalized_col.lower() # Convertir a minúsculas
-            normalized_columns.append(normalized_col)
-        df.columns = normalized_columns
-        
-        # Verificar que las columnas esperadas estén presentes después de normalizar el encabezado
-        # AQUI ES DONDE SE CORRIGE EL NOMBRE DE LA COLUMNA ESPERADA
-        expected_columns = ['nombre_del_lugar', 'direccion_completa', 'georeferencia']
-        if not all(col in df.columns for col in expected_columns):
-            print(f"❌ Error: El archivo '{INPUT_FILE_UBICACION}' no contiene las columnas esperadas después de la normalización del encabezado.")
-            print(f"DEBUG: Columnas encontradas (normalizadas): {df.columns.tolist()}")
-            print(f"DEBUG: Columnas esperadas: {expected_columns}")
+    # Lista de codificaciones a intentar
+    tried_encodings = ['latin-1', 'cp1252', 'utf-8'] # Priorizar latin-1 y cp1252
+    file_read_successful = False
+    read_encoding = None
+
+    for enc in tried_encodings:
+        try:
+            with open(INPUT_FILE_UBICACION, "r", encoding=enc, errors='replace') as file:
+                lineas = file.readlines()
+            print(f"DEBUG: Datos de ubicación extraídos exitosamente desde '{INPUT_FILE_UBICACION}' con codificación '{enc}'.")
+            read_encoding = enc
+            file_read_successful = True
+            break # Si se lee con éxito, salir del bucle
+        except Exception as e:
+            print(f"DEBUG: Fallo al leer con '{enc}': {e}")
+            continue # Intentar con la siguiente codificación
+
+    if not file_read_successful:
+        print(f"❌ Error crítico: No se pudo leer el archivo '{INPUT_FILE_UBICACION}' con ninguna de las codificaciones intentadas ({', '.join(tried_encodings)}).")
+        return # Salir de la función si no se pudo leer el archivo
+
+    data = []
+    # Definir los encabezados esperados para facilitar la lectura.
+    expected_headers_raw = ["Nombre del lugar", "Dirección Completa", "Georeferencia"] 
+    
+    # Normalizar los encabezados esperados de una vez para la comparación
+    normalized_expected_headers_for_comparison = [normalize_string_for_comparison(h).lower() for h in expected_headers_raw]
+
+
+    # Procesar el encabezado
+    if lineas:
+        # Primero, limpia toda la línea de encabezado, incluyendo caracteres de inicio de BOM y cualquier espacio extra
+        header_line = lineas[0].strip().replace('\ufeff', '')
+
+        # Determinar el delimitador principal. Prioriza ';' si está presente, de lo contrario usa ','
+        if ';' in header_line:
+            raw_headers = header_line.split(';')
+        elif ',' in header_line:
+            raw_headers = header_line.split(',')
+        else:
+            print(f"❌ Error: El encabezado del archivo '{INPUT_FILE_UBICACION}' no usa ';' ni ',' como delimitador.")
             return
 
-        # Asegurarse de que el DataFrame no esté vacío después de leer
-        if df.empty:
-            print(f"⚠️ Advertencia: El archivo '{INPUT_FILE_UBICACION}' se leyó (posiblemente solo el encabezado), pero no contiene datos válidos.")
+        # Normalizar cada encabezado usando la función auxiliar (solo para comparación, luego se hace lowercase)
+        headers = [normalize_string_for_comparison(h).lower() for h in raw_headers]
+        
+        print(f"DEBUG (repr): headers={repr(headers)}")
+        print(f"DEBUG (repr): expected_headers={repr(normalized_expected_headers_for_comparison)}")
+        # Asegurarse de que la comprensión de lista se resuelva antes de pasarla al f-string
+        headers_ord_values = [list(map(ord, s)) for s in headers]
+        expected_headers_ord_values = [list(map(ord, s)) for s in normalized_expected_headers_for_comparison]
+
+        print(f"DEBUG (ord): headers={headers_ord_values}")
+        print(f"DEBUG (ord): expected_headers={expected_headers_ord_values}")
+
+
+        # Verificar si los encabezados normalizados coinciden con los esperados
+        if headers != normalized_expected_headers_for_comparison: # Comparar las listas normalizadas
+            print(f"❌ Error: El archivo '{INPUT_FILE_UBICACION}' no contiene las columnas esperadas en el encabezado.")
+            print(f"DEBUG: Columnas encontradas (normalizadas para comparación): {headers}")
+            print(f"DEBUG: Columnas esperadas (normalizadas para comparación): {normalized_expected_headers_for_comparison}")
             return
         
-        print("✅ Datos de ubicación extraídos exitosamente.")
-        print("\nDEBUG: Primeras filas del DataFrame DESPUÉS DE LECTURA Y NORMALIZACIÓN DE COLUMNAS:")
-        print(df.head().to_string(index=False)) 
-        print(f"DEBUG: DataFrame tiene {len(df)} filas.")
-        print("\n")
+        # Procesar el resto de las líneas
+        for i, linea in enumerate(lineas[1:]): # Empezar desde la segunda línea (después del encabezado)
+            linea = linea.strip()
+            if not linea: # Ignorar líneas vacías
+                continue
 
-    except FileNotFoundError:
-        print(f"❌ Error: El archivo de entrada '{INPUT_FILE_UBICACION}' para ubicación no fue encontrado.")
-        return
-    except pd.errors.EmptyDataError:
-        print(f"❌ Error: El archivo '{INPUT_FILE_UBICACION}' está vacío o no contiene datos válidos CSV/TSV.")
-        return
-    except Exception as e:
-        print(f"❌ Error al leer el archivo de ubicación: {e}")
-        return
+            # Intentar dividir por ';' y luego por ',' para el cuerpo de los datos
+            # Priorizar el delimitador principal para los 3 campos base
+            parts = None
+            if ';' in linea:
+                parts = [p.strip() for p in linea.split(';')]
+            elif ',' in linea:
+                parts = [p.strip() for p in linea.split(',')]
+            else:
+                print(f"DEBUG: Línea {i+2} ignorada por formato desconocido: '{linea}'")
+                continue
 
-    # ------------------------------------------------------
-    # PASO 1.5: Limpieza defensiva de filas que puedan ser encabezados duplicados como datos
-    # Esto ocurre si el header se repite en la data o si la lectura inicial falló en identificarlo
-    # ------------------------------------------------------
-    rows_before_defensive_clean = len(df)
-    # Definir los valores de encabezado normalizados que NO deberían aparecer como datos
-    # Usar los nombres de columna normalizados para la comparación
-    header_values_to_remove = {
-        'nombre_del_lugar': remove_accents("Nombre del lugar").strip().replace(' ', '_').lower(),
-        'direccion_completa': remove_accents("Dirección Completa").strip().replace(' ', '_').lower(),
-        'georeferencia': remove_accents("Georeferencia").strip().replace(' ', '_').lower()
-    }
+            # Asegurarse de que tenemos el número correcto de partes
+            if parts and len(parts) == 3: # Esperamos 3 campos: nombre_del_lugar, direccion_completa, georeferencia
+                nombre_lugar_raw = parts[0] if parts[0] != '""' else None
+                direccion_completa_raw = parts[1] if parts[1] != '""' else None
+                georeferencia_raw = parts[2] if parts[2] != '""' else None
+                
+                # latitud_num, longitud_num ya no son necesarios para la deduplicación principal
+                # se mantienen como parte de la cadena de georeferencia normalizada
+                data.append({
+                    "nombre_del_lugar": nombre_lugar_raw, 
+                    "direccion_completa": direccion_completa_raw,
+                    "georeferencia": georeferencia_raw,
+                })
+            else:
+                print(f"DEBUG: Línea {i+2} con número inesperado de campos ({len(parts) if parts else 'N/A'}): '{linea}'")
+
+    # Crear DataFrame inicial con todos los datos parseados
+    df_raw = pd.DataFrame(data)
+    print(f"DEBUG: DataFrame inicial creado con {len(df_raw)} filas.")
+    print("DEBUG: Primeras filas del DataFrame inicial:")
+    print(df_raw.head().to_string(index=False))
+
+    # --- Paso 2: Normalizar columnas de texto para deduplicación y carga final ---
+    # Aplicar normalize_string_for_comparison a todas las columnas de texto relevantes
+    for col in ["nombre_del_lugar", "direccion_completa", "georeferencia"]:
+        if col in df_raw.columns:
+            df_raw[col] = df_raw[col].astype(str).apply(lambda x: normalize_string_for_comparison(x) if pd.notna(x) else None)
     
-    # Crear una máscara booleana para identificar las filas que coinciden exactamente con los valores del encabezado
-    # Se asegura que la comparación sea con el tipo str para evitar errores si hay NaN
-    mask_is_header_row = df.apply(lambda row: all(str(row[col]).strip().lower() == header_values_to_remove[col] 
-                                                  for col in expected_columns), axis=1)
+    print("\nDEBUG: DataFrame después de normalizar columnas de texto (para deduplicación y carga):")
+    print(df_raw.head(10).to_string(index=False))
+
+    # --- Paso 3: Eliminar duplicados ---
+    # La deduplicación ahora se realiza SÓLO sobre el nombre del lugar normalizado.
+    subset_cols_dedup = ["nombre_del_lugar"] # CAMBIO CLAVE AQUÍ
     
-    df = df[~mask_is_header_row] # Filtrar para remover esas filas
-    
-    rows_after_defensive_clean = len(df)
-    if rows_before_defensive_clean > rows_after_defensive_clean:
-        print(f"  - Filas que duplicaban valores de encabezado eliminadas: {rows_before_defensive_clean - rows_after_defensive_clean} filas.")
+    rows_before_dedup = len(df_raw)
+    # df_deduplicated contendrá las columnas ya normalizadas y en mayúsculas
+    df_deduplicated = df_raw.drop_duplicates(subset=subset_cols_dedup, inplace=False).copy()
+    rows_after_dedup = len(df_deduplicated)
+
+    if rows_before_dedup > rows_after_dedup:
+        print(f"✅ Se eliminaron {rows_before_dedup - rows_after_dedup} filas duplicadas (por nombre). Filas únicas: {rows_after_dedup}.")
     else:
-        print("  - No se encontraron filas con valores de encabezado duplicados para eliminar.")
-
-    print("\nDEBUG: Primeras filas del DataFrame DESPUÉS DE LIMPIEZA DEFENSIVA DE ENCABEZADOS:")
-    print(df.head().to_string(index=False)) 
-    print(f"DEBUG: DataFrame tiene {len(df)} filas.")
-    print("\n")
-
-    if df.empty:
-        print(f"⚠️ Advertencia: Después de la limpieza defensiva, el DataFrame de ubicación está vacío. Proceso ETL abortado.")
-        return # Si el DF está vacío, no hay nada más que hacer.
-
-    print("🔄 Iniciando transformación de datos de ubicación...")
-
-    # ------------------------------------------------------
-    # PASO 2: Limpiar filas con datos principales vacíos/nulos
-    # ------------------------------------------------------
-    initial_rows = len(df)
+        print("ℹ️ No se encontraron duplicados significativos para eliminar.")
     
-    df['nombre_lugar'] = df['nombre_del_lugar'].astype(str).str.strip().replace('', pd.NA) # Usar la columna correcta
-    df['direccion_completa'] = df['direccion_completa'].astype(str).str.strip().replace('', pd.NA)
-    df['georeferencia'] = df['georeferencia'].astype(str).str.strip().replace('', pd.NA)
-
-    df.dropna(subset=['nombre_lugar', 'direccion_completa', 'georeferencia'], how='all', inplace=True) # Actualizar subset de dropna
+    # Después de la deduplicación, generar IDs secuenciales
+    df_deduplicated['id'] = range(1, len(df_deduplicated) + 1)
     
-    cleaned_rows = len(df)
-    if initial_rows > cleaned_rows:
-        print(f"  - Filas completamente vacías o con datos principales nulos/vacíos eliminadas: {initial_rows - cleaned_rows} filas removidas.")
-    else:
-        print("  - No se encontraron filas completamente vacías o con datos principales nulos/vacíos para eliminar en esta etapa.")
+    # Reemplazar valores "NAN" (que pueden aparecer por la conversión de pd.NA a str y luego a mayúsculas) por None o cadena vacía
+    for col in ["nombre_del_lugar", "direccion_completa", "georeferencia"]:
+         if col in df_deduplicated.columns:
+             df_deduplicated[col] = df_deduplicated[col].replace({pd.NA: None, 'NAN': None}).fillna('')
 
-    print("\nDEBUG: Primeras filas del DataFrame DESPUÉS DE LIMPIEZA DE VACÍOS/NULOS:")
-    print(df.head().to_string(index=False)) 
-    print(f"DEBUG: DataFrame tiene {len(df)} filas.")
-    print("\n")
-
-    if df.empty:
-        print(f"⚠️ Advertencia: Después de la limpieza inicial, el DataFrame de ubicación está vacío. Proceso ETL abortado.")
-        return # Si el DF está vacío, no hay nada más que hacer.
+    # Reordenar las columnas para que 'id' sea la primera y los nombres coincidan con la imagen
+    df_final_table = df_deduplicated[['id', 'nombre_del_lugar', 'direccion_completa', 'georeferencia']].copy()
+    df_final_table.rename(columns={
+        'nombre_del_lugar': 'Nombre', 
+        'direccion_completa': 'Direccion', 
+        'georeferencia': 'Georeferencia'
+    }, inplace=True)
 
 
-    # ------------------------------------------------------
-    # PASO 3: Separar georeferencia en latitud y longitud
-    # ------------------------------------------------------
-    df[['latitud', 'longitud']] = df['georeferencia'].str.split(',', expand=True)
-    df['latitud'] = pd.to_numeric(df['latitud'].str.strip(), errors='coerce') # 'coerce' convierte errores a NaN
-    df['longitud'] = pd.to_numeric(df['longitud'].str.strip(), errors='coerce')
-    print("  - Georeferencias separadas en latitud y longitud.")
-    
-    # ------------------------------------------------------
-    # PASO 4: Normalizar la dirección
-    # Extraer nombre_calle, numero_calle, ciudad_estado_provincia, país
-    # La columna 'pais' se generará aquí.
-    # ------------------------------------------------------
-    df[['nombre_calle', 'numero_calle', 'ciudad_estado_provincia', 'pais']] = df.apply(
-        lambda row: pd.Series(parse_direccion(row['direccion_completa'])), axis=1
+    print("\nDEBUG: DataFrame final listo para la carga en la tabla única:")
+    print(df_final_table.head(10).to_string(index=False))
+    print(f"DEBUG: DataFrame final tiene {len(df_final_table)} filas.")
+
+
+    # --- Paso 4: Conectar a SQLite y crear la tabla única ---
+    conn = sqlite3.connect(DATABASE_NAME_UBICACION)
+    cursor = conn.cursor()
+
+    # Crear la tabla única 'ubicacion_norm'
+    cursor.execute(f"""
+    CREATE TABLE IF NOT EXISTS {NORMALIZED_TABLE_UBICACION} (
+        id INTEGER PRIMARY KEY,
+        Nombre TEXT,
+        Direccion TEXT,
+        Georeferencia TEXT
     )
-    print("  - Dirección completa parseada y normalizada (incluyendo país).")
+    """)
+    print(f"✅ Tabla '{NORMALIZED_TABLE_UBICACION}' creada o verificada en '{DATABASE_NAME_UBICACION}'.")
 
-    # --- Normalizar columnas clave para deduplicación ---
-    # Asegurar que todas las columnas usadas para deduplicación estén limpias
-    df['nombre_lugar'] = df['nombre_lugar'].astype(str).str.strip().str.upper()
-    df['pais'] = df['pais'].astype(str).str.strip().str.upper()
-
-
-    # ------------------------------------------------------
-    # PASO 5: Eliminar duplicados lógicos (basado en nombre de lugar, país y coordenadas)
-    # ------------------------------------------------------
-    filas_antes_dup_logical = len(df)
+    # --- Paso 5: Insertar datos en la tabla única ---
+    df_final_table.to_sql(NORMALIZED_TABLE_UBICACION, conn, if_exists='replace', index=False)
+    print(f"✅ Datos insertados en '{NORMALIZED_TABLE_UBICACION}'. {len(df_final_table)} filas.")
     
-    # Rellenar NaN en lat/lon temporalmente para que drop_duplicates los trate como iguales
-    # Se usa un valor que es muy poco probable que aparezca en coordenadas reales
-    df['latitud'].fillna(-999999.0, inplace=True) 
-    df['longitud'].fillna(-999999.0, inplace=True) 
+    conn.commit() # Guarda los cambios en la base de datos.
+    conn.close() # Cierra la conexión a la base de datos.
 
-    # Realizar la deduplicación
-    df.drop_duplicates(subset=['nombre_lugar', 'pais', 'latitud', 'longitud'], inplace=True)
-    
-    # Restaurar los NaN después de la deduplicación
-    df['latitud'].replace(-999999.0, pd.NA, inplace=True)
-    df['longitud'].replace(-999999.0, pd.NA, inplace=True)
+    print(f"✅ Tabla '{NORMALIZED_TABLE_UBICACION}' cargada exitosamente. Total de lugares únicos: {len(df_final_table)}.")
 
-
-    if filas_antes_dup_logical > len(df):
-        print(f"  - Duplicados lógicos (nombre, país, geo) eliminados: {filas_antes_dup_logical - len(df)} filas removidas.")
-    else:
-        print("  - No se encontraron duplicados lógicos significativos para eliminar en esta etapa.")
-    
-    print("\nDEBUG: Primeras filas del DataFrame DESPUÉS DE DEDUPLICACIÓN LÓGICA:")
-    print(df.head().to_string(index=False)) 
-    print(f"DEBUG: DataFrame tiene {len(df)} filas.")
-    print("\n")
-
-    # Reportar cuántas filas tienen lat/lon inválidas DESPUÉS de la separación y deduplicación
-    invalid_geo_rows = df['latitud'].isna().sum() + df['longitud'].isna().sum()
-    if invalid_geo_rows > 0:
-        print(f"  ⚠️ Advertencia: {invalid_geo_rows} entradas restantes con latitud/longitud inválida. Serán omitidas en la carga a Georeferencias.")
-
-
-    # ------------------------------------------------------
-    # PASO 6: Asignar ID únicos (después de todas las limpiezas y deduplicaciones)
-    # ------------------------------------------------------
-    df = df.reset_index(drop=True) # Resetear índice para asegurar IDs secuenciales comenzando desde 0
-    df['id'] = df.index + 1  # ID autoincremental que ahora sí debe empezar en 1
-    # Antes de renombrar, asegúrate de que la columna 'nombre_lugar' que se va a utilizar exista
-    # y que 'nombre_del_lugar' ya no sea necesaria o se haya transformado.
-    # Si 'nombre_lugar' se creó a partir de 'nombre_del_lugar' en un paso anterior,
-    # esta línea es redundante. Si 'nombre_del_lugar' aún existe y es la que contiene los datos,
-    # entonces se debe renombrar para que los pasos posteriores usen el nombre esperado.
-    if 'nombre_del_lugar' in df.columns and 'nombre_lugar' not in df.columns:
-        df.rename(columns={'nombre_del_lugar': 'nombre_lugar'}, inplace=True)
-
-
-    print("  - IDs únicos asignados a los datos limpios y finales.")
-    print("\nDEBUG: Primeras filas del DataFrame DESPUÉS DE ASIGNACIÓN DE IDS:")
-    print(df.head().to_string(index=False)) 
-    print(f"DEBUG: DataFrame tiene {len(df)} filas.")
-    print("\n")
-    
-    print("✅ Transformación de datos de ubicación completada.\n")
-
-
-    # ------------------------------------------------------
-    # PASO 7: Conectar a SQLite y crear tablas si no existen
-    # ------------------------------------------------------
-    print(f"📦 Cargando datos de ubicación en la base de datos '{DATABASE_NAME_UBICACION}'...")
-    conn = None # Inicializar conn a None
+    # --- Verificación final (opcional) ---
     try:
-        conn = sqlite3.connect(DATABASE_NAME_UBICACION)
-        cursor = conn.cursor()
+        conn_check = sqlite3.connect(DATABASE_NAME_UBICACION)
+        print(f"\n📊 Contenido de la tabla '{NORMALIZED_TABLE_UBICACION}' después de la carga:")
+        print(pd.read_sql_table(NORMALIZED_TABLE_UBICACION, con=conn_check).to_string(index=False))
 
-        # Tabla Lugares
-        cursor.execute(f"""
-        CREATE TABLE IF NOT EXISTS {TABLE_LUGARES} (
-            id INTEGER PRIMARY KEY,
-            nombre_lugar TEXT
-        )
-        """)
-
-        # Tabla Georeferencias
-        cursor.execute(f"""
-        CREATE TABLE IF NOT EXISTS {TABLE_GEOREFERENCIAS} (
-            id INTEGER PRIMARY KEY,
-            latitud REAL,
-            longitud REAL
-        )
-        """)
-
-        # Tabla Direcciones
-        cursor.execute(f"""
-        CREATE TABLE IF NOT EXISTS {TABLE_DIRECCIONES} (
-            id INTEGER PRIMARY KEY,
-            nombre_calle TEXT,
-            numero_calle TEXT,
-            ciudad_estado_provincia TEXT,
-            pais TEXT
-        )
-        """)
-        print("  - Tablas SQLite creadas/verificadas.")
-
-        # ------------------------------------------------------
-        # PASO 8: Insertar los datos procesados en las 3 tablas
-        # ------------------------------------------------------
-        inserted_rows_count = 0
-        for _, row in df.iterrows():
-            # Saltar si hay latitud o longitud inválida (NaN), ya que Georeferencias lo requiere
-            if pd.isna(row['latitud']) or pd.isna(row['longitud']):
-                # Ya se reportó en transformación, aquí solo se omite la inserción en Georeferencias
-                # Pero intentamos insertar en Lugares y Direcciones si tienen datos
-                if pd.isna(row['nombre_lugar']) and pd.isna(row['nombre_calle']):
-                    # Si no hay ni lugar ni calle, esta fila es completamente inútil
-                    print(f"DEBUG: Omitiendo inserción de fila con ID {row['id']} debido a falta de datos útiles (ni geo, ni nombre, ni dirección).")
-                    continue
-                else:
-                    print(f"DEBUG: Fila con ID {row['id']} tiene geo-datos inválidos, insertando solo en Lugares y Direcciones si es posible.")
-
-            # Insertar en tabla Lugares (si el nombre_lugar no es nulo)
-            if pd.notna(row['nombre_lugar']):
-                cursor.execute(f"INSERT INTO {TABLE_LUGARES} (id, nombre_lugar) VALUES (?, ?)",
-                               (row['id'], row['nombre_lugar']))
-
-            # Insertar en tabla Georeferencias (solo si latitud y longitud son válidas)
-            if pd.notna(row['latitud']) and pd.notna(row['longitud']):
-                cursor.execute(f"INSERT INTO {TABLE_GEOREFERENCIAS} (id, latitud, longitud) VALUES (?, ?, ?)",
-                               (row['id'], row['latitud'], row['longitud']))
-
-            # Insertar en tabla Direcciones (si al menos el nombre de calle o el país no son nulos)
-            if pd.notna(row['nombre_calle']) or pd.notna(row['pais']):
-                cursor.execute(f"""
-                    INSERT INTO {TABLE_DIRECCIONES} (id, nombre_calle, numero_calle, ciudad_estado_provincia, pais)
-                    VALUES (?, ?, ?, ?, ?)
-                """, (
-                    row['id'], row['nombre_calle'], row['numero_calle'],
-                    row['ciudad_estado_provincia'], row['pais']
-                ))
-            inserted_rows_count += 1 # Contar las filas que al menos intentaron insertarse
-
-        
-        conn.commit()
-        print(f"✅ Datos de ubicación cargados exitosamente en las tablas SQLite. ({inserted_rows_count} filas procesadas para inserción)")
-
-        # Verificación final de datos cargados (opcional, para visualización)
-        print(f"\n📊 Contenido de la tabla '{TABLE_LUGARES}':")
-        print(pd.read_sql_query(f"SELECT * FROM {TABLE_LUGARES}", conn))
-        print(f"\n📊 Contenido de la tabla '{TABLE_GEOREFERENCIAS}':")
-        print(pd.read_sql_query(f"SELECT * FROM {TABLE_GEOREFERENCIAS}", conn))
-        print(f"\n📊 Contenido de la tabla '{TABLE_DIRECCIONES}':")
-        print(pd.read_sql_query(f"SELECT * FROM {TABLE_DIRECCIONES}", conn))
-
-    except sqlite3.Error as e:
-        print(f"❌ Error de base de datos al cargar datos de ubicación: {e}")
+        conn_check.close()
     except Exception as e:
-        print(f"❌ Error general al cargar datos de ubicación: {e}")
-    finally:
-        if conn:
-            conn.close()
+        print(f"❌ Error al leer la tabla para verificación: {e}")
 
-    print("--- PROCESO ETL DE UBICACIÓN FINALIZADO ---\n")
+    print("\n--- PROCESO ETL DE UBICACIÓN FINALIZADO ---")
 
-# --- Código de demostración (se ejecuta solo si este archivo es el principal) ---
+# Si este script se ejecuta directamente, llama a la función ETL.
 if __name__ == "__main__":
     run_etl_ubicacion()
